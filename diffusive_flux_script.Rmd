@@ -1,0 +1,189 @@
+---
+title: "ABB flux data"
+author: "Laura Naslund"
+date: "6/16/2022"
+output:
+  html_document:
+    theme: spacelab
+    toc: true
+    toc_float: true
+    collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(digits.secs = 10)
+
+library(tidyverse)
+library(lubridate)
+library(xts)
+library(dygraphs)
+library(plotly)
+library(shiny)
+library(gridExtra)
+```
+
+## Load functions and data
+
+The function `file.finder()` searches through a directory for data files between specified dates. The ABB analyzer saves data in a folder labeled with the sampling date. This function works if all of the output folders are saved in a single directory and retain their original date names. This function also works to find temperature data, if the data are saved in the ABB date folders with the "temp" in the file name.
+
+* *data.path:* the file path for the directory where the data are saved
+* *start:* start date for the files to be analyzed
+* *end:* end date for the files to be analyzed 
+* *type:* file type ("flux" or "temperature")
+
+The function `read.flux()` loads and formats flux data files listed in a vector containing the file paths for desired flux files, such as the output from `file.finder()`.
+
+* *flux_files:* vector containing the file paths for desired flux files
+* *time.zone:* time zone of date times in flux files (complete list available with `OlsonNames()`)
+
+```{r load functions & files}
+source("gas_functions_final.R")
+
+flux_files <- file.finder(data.path = ".", start="2022-06-19", end= "2022-06-22", type="flux")
+temp_files <- file.finder(data.path = ".", start="2022-06-19", end= "2022-06-22", type="temperature")
+
+data <- read.flux(flux_files, "America/New_York")
+
+times <-read.csv("2022-06-20/times.csv") %>% filter(is.na(Start)==FALSE, is.na(End)==FALSE) %>% mutate(Start= ymd_hms(paste(Date, Start, sep=" "), tz="America/New_York"), End= ymd_hms(paste(Date, End, sep= " "), tz="America/New_York")) 
+```
+
+## Quickly and interactively visualize the time series 
+
+Drag cursor to zoom in. Double click to zoom out
+
+```{r visualize raw timeseries}
+# ch4_ts <- as.xts(data$CH4_dry, order.by=data$date_time)
+# co2_ts <- as.xts(data$CO2_dry, order.by=data$date_time)
+# 
+# dygraph(ch4_ts, main="CH4") %>%
+#   dyOptions(useDataTimezone = TRUE)
+# 
+# dygraph(co2_ts) %>%
+#   dyOptions(useDataTimezone = TRUE)
+```
+
+## Visualize and calculate slopes
+
+The function `calc.slopes()` returns a list with the calculated slopes between the start and end times specified by the user in a data frame, excluding some percentage of the data at the beginning of the time series, which is specified by the user. Because the times recorded by the user may not correspond to timestamps recorded by the analyzer, this function calls `return.ts()` which returns the closest recorded timestamp in the flux data file to the user specified time stamp. The list also contains plots of the fluxes for the user to manually inspect which data points are included in the slope calculation. Users should note the number at the beginning of the plot titles for the calculations they are unsatisfied with, because these numbers correspond to the index of that flux in the list returned by `calc.slopes()` and can be used in the function `shiny_edit()` to interactively select the portion of the time series used to calculate the slope. `calc.slopes()` will return a row index for every time step in which either the start time or end time is missing or the end time is before the start time.
+
+* *data_df:* the data frame containing the output from the analyzer
+* *times_df:* the data frame containing the times specified by the user as the start and end time of the flux measurements
+* *time.zone:* time zone of recorded dates
+* *perc_cut:* what percentage of the observations to cut from the slope calculation to account for any initial equilibration within the analyzer
+
+```{r calculate slopes}
+# This function takes a while to run
+flux_list <- calc.slopes(data, times, "America/New_York", 0)
+
+# make pdfs of default plots
+# pdf("ch4_plots.pdf", paper="a4", width=9, height=12)
+# marrangeGrob(grobs=compact(flux_list$ch4_plot), nrow=3, ncol=2)
+# dev.off()
+# 
+# pdf("co2_plots.pdf", paper="a4", width=9, height=12)
+# marrangeGrob(grobs=compact(flux_list$co2_plot), nrow=3, ncol=2)
+# dev.off()
+```
+
+## Interactively correct slopes
+
+The function `shiny_edit()` calls a shiny app interface which allows the user to manually select the portions of flux time series from which to calculate slope. The app has a separate tab for editing CH4 and CO2 fluxes. To display the first plot, select "Next plot." Select whether to accept or reject the default fit. If you select reject fit, hover over the upper right corner of the plot to click a select tool and highlight the portion of the time series you would like to select. Another plot should automatically display with the selected data a fit. Select "Next plot" to display the next plot. Demonstration of shiny app: https://youtu.be/X6fMNoqz77Y 
+
+* *flux.list:* the list containing the flux data, slopes, and intercepts (e.g., the output from `calc.slopes()`)
+* *ch4_ind_vec:* the needs_correct_ch4 vector with the indexes corresponding to the CH4 fluxes you which to interactively view and edit. This vector must be defined outside of the function call.
+* *co2_ind_vec:* the needs_correct_co2 vector with the indexes corresponding to the CO2 fluxes you which to interactively view and edit. This vector must be defined outside of the function call.
+
+```{r interactively edit slopes}
+# 6/28 throwing unclear errors
+needs_correct_ch4 <- c(1:4)
+needs_correct_co2 <- c(1:2)
+  
+correct_vec_ch4_m <- rep(NA, length(needs_correct_ch4))
+correct_vec_ch4_b <- rep(NA, length(needs_correct_ch4))
+correct_vec_co2_m <- rep(NA, length(needs_correct_co2))
+correct_vec_co2_b <- rep(NA, length(needs_correct_co2))
+
+# When you exit from the app this line will throw an error, keep going
+shiny_edit(flux.list = flux_list, ch4_ind_vec= needs_correct_ch4, co2_ind_vec = needs_correct_co2)
+```
+
+```{r}
+# create a list with the corrected values generated from the shiny interface
+flux_list_corrected <- flux_list
+
+for(i in 1:length(needs_correct_ch4)){
+  flux_list_corrected$s_ch4[[needs_correct_ch4[i]]] <- correct_vec_ch4_m[i]
+  flux_list_corrected$i_ch4[[needs_correct_ch4[i]]] <- correct_vec_ch4_b[i]
+  
+  if(flux_list_corrected$i_ch4[[needs_correct_ch4[i]]] != flux_list$i_ch4[[needs_correct_ch4[i]]]){
+       flux_list_corrected$ch4_plot[[needs_correct_ch4[i]]] <- ggplot(flux_list_corrected$data_filt[[needs_correct_ch4[i]]], aes(secs, CH4_dry))+
+          geom_point(aes(col=points))+
+          scale_color_manual(values=c("purple", "black"))+
+          geom_abline(intercept=flux_list_corrected$i_ch4[needs_correct_ch4[i]], slope=flux_list_corrected$s_ch4[needs_correct_ch4[i]], linetype="dashed")+
+          ggtitle(paste(needs_correct_ch4[i], ":", flux_list_corrected$site_loc[needs_correct_ch4[i]]))
+  }
+
+}
+
+for(i in 1:length(needs_correct_co2)){
+  flux_list_corrected$s_co2[[needs_correct_co2[i]]] <- correct_vec_co2_m[i]
+  flux_list_corrected$i_co2[[needs_correct_co2[i]]] <- correct_vec_co2_b[i]
+  
+  if(flux_list_corrected$i_co2[[needs_correct_co2[i]]]!= flux_list$i_co2[[needs_correct_co2[i]]]){
+    flux_list_corrected$co2_plot[[needs_correct_co2[i]]] <- ggplot(flux_list_corrected$data_filt[[needs_correct_co2[i]]], aes(secs, CO2_dry))+
+          geom_point(aes(col=points))+
+          scale_color_manual(values=c("purple", "black"))+
+          geom_abline(intercept=flux_list_corrected$i_co2[needs_correct_co2[i]], slope=flux_list_corrected$s_co2[needs_correct_co2[i]], linetype="dashed")+
+          ggtitle(paste(needs_correct_co2[i], ":", flux_list_corrected$site_loc[needs_correct_co2[i]]))
+  }
+}
+
+# Write pdfs with plots. Ones with edited slopes in purple. 
+pdf("ch4_plots_corrected.pdf", paper="a4", width=9, height=12)
+marrangeGrob(grobs=compact(flux_list_corrected$ch4_plot), nrow=3, ncol=2)
+dev.off()
+
+pdf("co2_plots_corrected.pdf", paper="a4", width=9, height=12)
+marrangeGrob(grobs=compact(flux_list_corrected$co2_plot), nrow=3, ncol=2)
+dev.off()
+```
+
+## Calculate fluxes 
+
+The function `read.temp()` loads and formats temperature data files listed in a vector containing the file paths for desired temperature files, such as the output from `file.finder()`. Note: if the slope for the flux was calculated from a subset of the data, this function does not subset the temperature time series
+
+* *temp_files:* vector containing the file paths for desired flux files
+* *time.zone:* time zone of date times in flux files (complete list available with `OlsonNames()`)
+
+The function `add.temps()` calculates the average temperature during each flux measurement specified by the user and appends them to the flux list. 
+
+ list containing the calculated slopes for each flux measurement, such as the output from `calc.slopes()`
+* *temp_data:* data frame containing formatted temperature data, such as the output from `read.temp()`
+* *perc_cut :* what percentage of the observations to cut from the slope calculation to account for any initial equilibration within the analyzer
+
+The function `calc_flux()` calculates gas flux from the calculated CH4 and CO2 slopes (e.g., the output of `calc.slopes()` edited by `shiny_edit()`), measured chamber temperature, chamber and accessory volumes using the ideal gas law. This function returns a data frame which can be exported using the write functions. 
+
+* *flux_list:* the list containing the flux data, slopes, and intercepts (e.g., the output from `calc.slopes()`)
+* *width:* chamber width in meters
+* *length:* chamber length in meters
+* *height:* chamber height in meters
+* *add_vol:* additional system volume (e.g., volume inside the analyzer and tubing) in cubic meters
+
+```{r flux calculation, warning=FALSE}
+temp_data <- read.temp(temp_files, "America/New_York")
+
+# to quickly visualize the temperature data uncomment the following lines
+
+# temp_ts <- as.xts(temp_data$temp, order.by=temp_data$date_time)
+# dygraph(temp_ts, main="temp") %>% 
+#   dyOptions(useDataTimezone = TRUE)
+
+flux_list_corrected <- add_temps(flux_list_corrected, temp_data, perc_cut=0)
+
+fluxes <- calc_flux(flux_list_corrected, width=0.3429, length=0.3429, height=0.127, add_vol = 0)
+
+file_name <- "test_fluxes.csv"
+write.csv(fluxes, file_name , row.names = F)
+```
+
