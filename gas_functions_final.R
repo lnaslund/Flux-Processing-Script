@@ -39,12 +39,19 @@ file.finder <- function(data.path=".", start="1800-01-01", end="2200-01-01", typ
 read.flux <- function(flux.files, time.zone){
   data <- NULL
   for(i in 1:length(flux.files)){
-    temp <- read.delim2(flux.files[i], sep=",", skip=1, header=T, skipNul = TRUE) %>% 
-      dplyr::select(SysTime, X.CH4.d_ppm, X.CO2.d_ppm) %>% 
-      rename(date_time = SysTime, CH4_dry=X.CH4.d_ppm, CO2_dry = X.CO2.d_ppm) %>% 
-      mutate(date_time = mdy_hms(date_time, tz=time.zone), CH4_dry = as.numeric(CH4_dry), CO2_dry = as.numeric(CO2_dry))
-    
-    data <- rbind(data, temp)
+    tryCatch(
+      exp = {
+        temp <- read.delim2(flux.files[i], sep=",", skip=1, header=T, skipNul = TRUE) %>% 
+          dplyr::select(SysTime, X.CH4.d_ppm, X.CO2.d_ppm) %>% 
+          rename(date_time = SysTime, CH4_dry=X.CH4.d_ppm, CO2_dry = X.CO2.d_ppm) %>% 
+          mutate(date_time = mdy_hms(date_time, tz=time.zone), CH4_dry = as.numeric(CH4_dry), CO2_dry = as.numeric(CO2_dry))
+        
+        data <- rbind(data, temp)
+      },
+      error = function(e){
+        message(paste0("Read error for file:", flux.files[i]))
+      }
+    )
   }
   return(data)
 }
@@ -53,10 +60,21 @@ read.flux <- function(flux.files, time.zone){
 read.temp <- function(temp.files, time.zone){
   temp_data <- NULL
   for(i in 1:length(temp.files)){
-    temp <- read.delim(temp.files[i], skip=2, header=T )%>% 
-      rename("date_time" = "Date.Time..GMT..0400", temp = "Temp....F.") %>% 
-      dplyr::select(date_time, temp) %>% 
-      mutate(date_time = ymd_hms(date_time, tz = time.zone), temp_k = (temp-32)*(5/9)+273.15)
+    temp <- data.table::fread(temp.files[i], skip=2, header=T)
+    
+    if( "Temp, (*C)" %in% names(temp)){
+      temp <- temp %>% rename("date_time" = "Date Time, GMT -0400", "temp" = "Temp, (*C)") %>% 
+        dplyr::select(date_time, temp) %>% 
+        mutate(date_time = ymd_hms(date_time, tz = time.zone), temp_k = temp+273.15)
+    }
+    
+    else{
+      temp <- temp %>% 
+        rename("date_time" = "Date Time, GMT -0400", temp = "Temp, (*F)") %>% 
+        dplyr::select(date_time, temp) %>% 
+        mutate(date_time = ymd_hms(date_time, tz = time.zone), temp_k = (temp-32)*(5/9)+273.15)
+    }
+    
     
     temp_data <- rbind(temp_data, temp)
   }
@@ -74,25 +92,24 @@ return.ts <- function(df, time.stamp, time.zone){
 }
 
 #################
+# Calculates slopes using slr
 
-# TODO: Write in a better exception handler 
-
-calc.slopes <- function(data_df, times_df, time.zone, perc_cut=0.2){
+calc.slopes.slr <- function(data_df, times_df, time.zone, perc_cut=0.2){
   flux_list <- list()
-  
+
   flux_list$site <- times_df$Site
   flux_list$location <- times_df$Location
   flux_list$start <- times_df$Start
   flux_list$site_loc <- paste(times_df$Site, times_df$Location, times_df$Start, sep=" ")
   flux_list$start <- return.ts(data_df, times_df$Start, time.zone)
   flux_list$end <- return.ts(data_df, times_df$End, time.zone)
-  
+
   data_filt <- list()
   ch4_plot <- list()
   co2_plot <- list()
 
     for(i in 1:length(flux_list$start)){
-      
+
       if(flux_list$start[i]>flux_list$end[i] | is.na(seconds(flux_list$start[i])) | is.na(seconds(flux_list$end[i]))){
         data_filt[[i]] <- NULL
         flux_list$s_ch4[i] <- NA
@@ -103,34 +120,177 @@ calc.slopes <- function(data_df, times_df, time.zone, perc_cut=0.2){
         co2_plot[[i]] <- NULL
         print(paste0("Timestamp error row ", i))
       }
-      
+
       else{
-        data_filt[[i]] <- data_df %>% filter(date_time > flux_list$start[i], date_time < flux_list$end[i]) %>% 
-          mutate(secs=as.numeric(seconds(date_time)), secs = secs-min(secs)) %>% 
+        data_filt[[i]] <- data_df %>% filter(date_time > flux_list$start[i], date_time < flux_list$end[i]) %>%
+          mutate(secs=as.numeric(seconds(date_time)), secs = secs-min(secs)) %>%
           mutate(points =if_else(row_number() %in% c((round(perc_cut*n(), digits=0):n())), "included", "excluded"))
-        
-        
+
+
         flux_list$s_ch4[i] <- summary(lm(CH4_dry ~ secs, data=data_filt[[i]] %>% filter(points=="included")))$coefficients[2,1]
         flux_list$i_ch4[i] <- summary(lm(CH4_dry ~ secs, data=data_filt[[i]] %>% filter(points=="included")))$coefficients[1,1]
-        
+
         flux_list$s_co2[i] <- summary(lm(CO2_dry ~ secs, data=data_filt[[i]] %>% filter(points=="included")))$coefficients[2,1]
         flux_list$i_co2[i] <- summary(lm(CO2_dry ~ secs, data=data_filt[[i]] %>% filter(points=="included")))$coefficients[1,1]
-        
-        
+
+
         ch4_plot[[i]] <- ggplot(data_filt[[i]], aes(secs, CH4_dry))+
           geom_point(aes(col=points))+
-          scale_color_manual(values=c("red", "black"))+
+          scale_color_manual(values=c("black", "grey"))+
           geom_abline(intercept=flux_list$i_ch4[i], slope=flux_list$s_ch4[i], linetype="dashed")+
           ggtitle(paste(i, ":", flux_list$site_loc[i]))
-        
-        
+
+
         co2_plot[[i]] <- ggplot(data_filt[[i]], aes(secs, CO2_dry))+
           geom_point(aes(col=points))+
-          scale_color_manual(values=c("red", "black"))+
+          scale_color_manual(values=c("black", "grey"))+
           geom_abline(intercept=flux_list$i_co2[i], slope=flux_list$s_co2[i], linetype="dashed")+
           ggtitle(paste(i, ":", flux_list$site_loc[i]))
-        
+
       }
+
+
+  }
+
+  flux_list$data_filt <- data_filt
+  flux_list$ch4_plot <- ch4_plot
+  flux_list$co2_plot <- co2_plot
+
+  return(flux_list)
+}
+
+####################################
+
+point.slopes <- function(ts, num.pts){
+  
+  slope_list <- list()
+  ts_list <- list()
+  
+  for(i in 1:(nrow(ts)-num.pts+1)){
+    slope_list$start[i] <- i
+    ind <- c(i:(i+num.pts-1))
+    ts_list[[i]] <- ts %>% slice(ind)
+    
+    slope_list$slope_ch4[i] <- coef(lm(CH4_dry ~ secs, data=ts %>% slice(ind)))[[2]]
+    slope_list$r2_ch4[i] <- summary(lm(CH4_dry ~ secs, data=ts %>% slice(ind)))$r.squared
+    
+    slope_list$slope_co2[i] <- coef(lm(CO2_dry ~ secs, data=ts %>% slice(ind)))[[2]]
+    slope_list$r2_co2[i] <- summary(lm(CO2_dry ~ secs, data=ts %>% slice(ind)))$r.squared
+  }
+  
+  slope_list$data <- ts_list
+  slope_list$dens_ch4 <- density(slope_list$slope_ch4, na.rm=T) 
+  slope_list$dens_co2 <- density(slope_list$slope_co2, na.rm=T) 
+  slope_list$dens_max_ch4 <- slope_list$dens_ch4$x[which.max(slope_list$dens_ch4$y)]
+  slope_list$dens_max_co2 <- slope_list$dens_co2$x[which.max(slope_list$dens_co2$y)]
+  slope_list$dens_plot_ch4 <- ggplot(data.frame(slope=slope_list$slope_ch4), aes(slope))+geom_density()+ geom_vline(xintercept=slope_list$dens_max_ch4)
+  slope_list$dens_plot_co2 <- ggplot(data.frame(slope=slope_list$slope_co2), aes(slope))+geom_density()+ geom_vline(xintercept=slope_list$dens_max_co2)
+  
+  xx_ch4 <- slope_list$dens_ch4$x
+  xx_co2 <- slope_list$dens_co2$x
+  dx_ch4 <- xx_ch4[2]-xx_ch4[1]
+  dx_co2 <- xx_co2[2]-xx_co2[1]
+  yy_ch4 <-slope_list$dens_ch4$y
+  yy_co2 <-slope_list$dens_co2$y
+  
+  max_ch4 <- slope_list$dens_max_ch4
+  max_co2 <- slope_list$dens_max_co2
+  
+  C_ch4 <- sum(yy_ch4)*dx_ch4
+  C_co2 <- sum(yy_co2)*dx_co2
+  
+  prob_ch4 <- NULL
+  for(i in 1: length(xx_ch4)){
+    p_ch4 <- (sum(yy_ch4[xx_ch4<= max_ch4 + i*dx_ch4])* dx_ch4)/C_ch4 - (sum(yy_ch4[xx_ch4 <= max_ch4 - i*dx_ch4])*dx_ch4)/C_ch4
+    prob_ch4 <- c(prob_ch4, p_ch4)
+  }
+  
+  prob_co2 <- NULL
+  for(i in 1: length(xx_co2)){
+    p_co2 <- (sum(yy_co2[xx_co2<= max_co2 + i*dx_co2])* dx_co2)/C_co2 - (sum(yy_co2[xx_co2 <= max_co2 - i*dx_co2])*dx_co2)/C_co2
+    prob_co2 <- c(prob_co2, p_co2)
+  }
+  
+  dev_ch4 <- which.min(abs(prob_ch4-0.1)) * dx_ch4
+  dev_co2 <- which.min(abs(prob_co2-0.1)) * dx_co2
+  
+  top_ch4 <- which(slope_list$slope_ch4 > slope_list$dens_max_ch4 - dev_ch4) 
+  top_co2 <- which(slope_list$slope_co2 > slope_list$dens_max_co2 - dev_co2) 
+  bottom_ch4 <- which(slope_list$slope_ch4 < slope_list$dens_max_ch4 + dev_ch4)
+  bottom_co2 <- which(slope_list$slope_co2 < slope_list$dens_max_co2 + dev_co2)
+  
+  int_ch4 <- intersect(top_ch4, bottom_ch4)
+  int_co2 <- intersect(top_co2, bottom_co2)
+  
+  inds_ch4 <- NULL
+  for(i in 1:length(int_ch4)){
+    inds_ch4 <- c(inds_ch4, int_ch4[i]:(int_ch4[i]+num.pts-1))
+  }
+  inds_co2 <- NULL
+  for(i in 1:length(int_co2)){
+    inds_co2 <- c(inds_co2, int_co2[i]:(int_co2[i]+num.pts-1))
+  }
+  
+  highlight_ch4 <- unique(inds_ch4)
+  highlight_co2 <- unique(inds_co2)
+  ts$num <- 1:nrow(ts)
+  
+  slope_list$plot_ch4 <- ts %>% mutate(hl = if_else(num %in% highlight_ch4, "include", "excluded")) %>% 
+    ggplot(aes(secs, CH4_dry))+ geom_point(aes(col=hl)) + scale_color_manual(values=c("black", "green")) + theme(legend.position = "none")
+  
+  
+  slope_list$plot_co2 <- ts %>% mutate(hl = if_else(num %in% highlight_co2, "include", "excluded")) %>% 
+    ggplot(aes(secs, CO2_dry))+ geom_point(aes(col=hl)) + scale_color_manual(values=c("black", "deepskyblue")) + theme(legend.position = "none")
+  
+  return(slope_list)
+} 
+
+
+#################################################
+calc.slopes <- function(data_df, times_df, time.zone, num.pts=10){
+  flux_list <- list()
+  
+  flux_list$site <- times_df$Location
+  flux_list$location <- times_df$Trap
+  flux_list$start <- times_df$Start
+  flux_list$site_loc <- paste(times_df$Location, times_df$`Trap #`, times_df$Start, sep=" ")
+  flux_list$start <- return.ts(data_df, times_df$Start, time.zone)
+  flux_list$end <- return.ts(data_df, times_df$End, time.zone)
+  
+  data_filt <- list()
+  ch4_plot <- list()
+  co2_plot <- list()
+  
+  for(i in 1:length(flux_list$start)){
+    
+    if(flux_list$start[i]>flux_list$end[i] | is.na(seconds(flux_list$start[i])) | is.na(seconds(flux_list$end[i]))){
+      data_filt[[i]] <- NULL
+      flux_list$s_ch4[i] <- NA
+      flux_list$i_ch4[i] <- NA
+      flux_list$s_co2[i] <- NA
+      flux_list$i_co2[i] <- NA
+      ch4_plot[[i]] <- NULL
+      co2_plot[[i]] <- NULL
+      print(paste0("Timestamp error row ", i))
+    }
+    
+    else{
+      data_filt[[i]] <- data_df %>% filter(date_time > flux_list$start[i], date_time < flux_list$end[i]) %>% 
+        mutate(secs=as.numeric(seconds(date_time)), secs = secs-min(secs))
+      
+      tryCatch(temp <- point.slopes(data_filt[[i]], num.pts), 
+               error=function(e)
+                 print(paste0("error time stamp number:", i)))
+      
+      flux_list$s_ch4[i] <- temp$dens_max_ch4
+      
+      flux_list$s_co2[i] <- temp$dens_max_co2
+      
+      ch4_plot[[i]] <- temp$plot_ch4 + ggtitle(paste0(i, ":", flux_list$site_loc[i], "  ", "\nm = ", round(flux_list$s_ch4[i],4)))
+      
+      co2_plot[[i]] <- temp$plot_co2 + ggtitle(paste0(i, ":", flux_list$site_loc[i], "  ", "\nm = ", round(flux_list$s_co2[i],4)))
+      
+    }
     
     
   }
@@ -141,7 +301,7 @@ calc.slopes <- function(data_df, times_df, time.zone, perc_cut=0.2){
   
   return(flux_list)
 }
-####################
+######################################
 
 shiny_edit <- function(flux.list = flux_list, ch4_ind_vec, co2_ind_vec){
   require(shiny)
@@ -435,13 +595,24 @@ shiny_edit <- function(flux.list = flux_list, ch4_ind_vec, co2_ind_vec){
 
 ####################
 
-add_temps <- function(flux_list, temp_data, perc_cut=0.2){
+add_temps <- function(flux_list, temp_data){
   for(i in 1:length(flux_list$start)){
     temp <- temp_data %>% filter(date_time > flux_list$start[i], date_time < flux_list$end[i]) %>% 
-      mutate(secs=as.numeric(seconds(date_time)), secs = secs-min(secs)) %>% 
-      mutate(points =if_else(row_number() %in% c((round(perc_cut*n(), digits=0):n())), "included", "excluded"))
+      mutate(secs=as.numeric(seconds(date_time)), secs = secs-min(secs))
     flux_list$temperature[i] <- mean(temp$temp_k)
   }
+  return(flux_list)
+}
+
+################
+add_temps_sync <- function(flux_list, temp_data){
+  temp_filt <- list()
+  for(i in 1:length(flux_list$start)){
+    temp_filt[[i]] <- temp_data %>% filter(date_time > flux_list$start[i], date_time < flux_list$end[i]) %>% 
+      mutate(secs=as.numeric(seconds(date_time)), secs = secs-min(secs))
+    flux_list$data_filt[i][[1]] <- flux_list$data_filt[i][[1]] %>% mutate(secs=round(secs, digits=0)) %>% left_join(temp_filt[[i]], by="secs")
+  }
+  flux_list$temp_filt <- temp_filt
   return(flux_list)
 }
 ####################
@@ -473,3 +644,4 @@ calc_flux <- function(flux_list, width, length, height, add_vol, R=8.205746 * 10
   ret <- data.frame("site" = flux_list$site, "location" = flux_list$location, "start_time"=flux_list$start, "flux_ch4_mmol"=flux_ch4_mol, "flux_ch4_g"=flux_ch4_g, "flux_co2_mmol"=flux_co2_mol, "flux_co2_g"=flux_co2_g)
   return(ret)
 }
+
